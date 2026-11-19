@@ -859,6 +859,7 @@ class VaultViewModel: ObservableObject {
                 if Task.isCancelled { break }
 
                 while isPaused && !Task.isCancelled {
+                    progressText = "⏸️ متوقف مؤقتاً عند @\(acc.username) (\(index + 1)/\(targetAccounts.count))"
                     try? await Task.sleep(nanoseconds: 400_000_000)
                 }
                 if Task.isCancelled { break }
@@ -872,9 +873,9 @@ class VaultViewModel: ObservableObject {
                 case .success(let savedCount):
                     failedAccounts.removeAll { $0.account.username.lowercased() == acc.username.lowercased() }
                     if savedCount > 0 {
-                        appendLog("✅ @\(acc.username): تم حفظ \(savedCount) مقطع جديد")
+                        appendLog("✅ @\(acc.username): تم حفظ \(savedCount) ستوري جديد")
                     } else {
-                        appendLog("ℹ️ @\(acc.username): لا توجد مقاطع جديدة (محدث)")
+                        appendLog("ℹ️ @\(acc.username): لا توجد ستوريات جديدة (محدث)")
                     }
                 case .failure(let err):
                     let reason = err.localizedDescription
@@ -903,7 +904,7 @@ class VaultViewModel: ObservableObject {
         }
     }
 
-    // MARK: - محرك التحميل المستهدف للقصص اليومية ومنصة الأضواء
+    // MARK: - محرك التحميل المزدوج (يدعم __NEXT_DATA__ القديم + __next_f.push الجديد RSC)
 
     private struct StorySnapInfo {
         let id: String
@@ -925,7 +926,6 @@ class VaultViewModel: ObservableObject {
         request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
         request.setValue("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
         request.setValue("https://www.snapchat.com", forHTTPHeaderField: "Referer")
-        request.setValue("keep-alive", forHTTPHeaderField: "Connection")
 
         do {
             let (data, response) = try await downloadSession.data(for: request)
@@ -938,22 +938,32 @@ class VaultViewModel: ObservableObject {
             }
 
             var snaps: [StorySnapInfo] = []
+            var foundValidPageStructure = false
+
+            // 1. الطريقة الأولى: فحص __NEXT_DATA__ (للحسابات على النظام القديم)
             if let jsonString = extractNextDataJSON(from: html),
                let jsonData = jsonString.data(using: .utf8),
                let rootObj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                foundValidPageStructure = true
                 snaps = parseStoryOnlyFromNextData(rootObj)
             }
 
-            // استخراج محتوى البطاقات النشطة ومنصة الأضواء والستوريات التي تحمل علامة الساعة
-            let fallbackSnaps = parseSnapsFallbackFromHTML(html)
-            for item in fallbackSnaps {
-                if !snaps.contains(where: { $0.mediaUrl == item.mediaUrl }) {
-                    snaps.append(item)
+            // 2. الطريقة الثانية: فحص self.__next_f.push (للحسابات المحدثة للنظام الجديد RSC مثل eleen_su)
+            if snaps.isEmpty {
+                let rscResult = parseStoryFromNextFlightRSC(html)
+                if rscResult.foundStructure {
+                    foundValidPageStructure = true
                 }
+                snaps = rscResult.snaps
             }
 
             if snaps.isEmpty {
-                return .failure(NSError(domain: "SnapVault", code: 4, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على مقاطع نشطة لهذا الحساب"]))
+                if foundValidPageStructure {
+                    // إذا كانت الصفحة سليمة ولكن الحساب ليس لديه ستوريات نشطة حالياً، نرجع 0 كمحدث بدون تسجيل خطأ
+                    return .success(0)
+                } else {
+                    return .failure(NSError(domain: "SnapVault", code: 3, userInfo: [NSLocalizedDescriptionKey: "لم يتم العثور على ستوريات يومية نشطة حالياً"]))
+                }
             }
 
             let folderURL = accountFolder(for: username)
@@ -1040,6 +1050,7 @@ class VaultViewModel: ObservableObject {
             return results
         }
 
+        // البحث في story المباشر أو داخل userProfile لضمان عدم تفويت أي ستوري
         if let story = pageProps["story"] as? [String: Any],
            let snapList = story["snapList"] as? [[String: Any]] {
             for (idx, item) in snapList.enumerated() {
@@ -1047,30 +1058,117 @@ class VaultViewModel: ObservableObject {
                     results.append(info)
                 }
             }
+        } else if let curatedHighlights = pageProps["curatedHighlights"] as? [[String: Any]], results.isEmpty {
+            // نتحقق أولاً من داخل أية كائنات story متداخلة في pageProps
+            results = findSnapListRecursively(in: pageProps)
+            _ = curatedHighlights
+        } else {
+            results = findSnapListRecursively(in: pageProps)
         }
 
         return results
     }
 
-    private func parseSnapsFallbackFromHTML(_ html: String) -> [StorySnapInfo] {
+    private func findSnapListRecursively(in dict: [String: Any]) -> [StorySnapInfo] {
         var results: [StorySnapInfo] = []
-        // استهداف روابط الوسائط النشطة في بطاقات العرض والستوريات
-        let pattern = #"(https://[^""'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^""'<>]*)?)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return results }
-        let matches = regex.matches(in: html, options: [], range: NSRange(html.startIndex..., in: html))
+        if let story = dict["story"] as? [String: Any],
+           let snapList = story["snapList"] as? [[String: Any]] {
+            for (idx, item) in snapList.enumerated() {
+                if let info = extractSingleSnap(from: item, sequenceIndex: idx) {
+                    results.append(info)
+                }
+            }
+            if !results.isEmpty { return results }
+        }
 
-        var seenUrls = Set<String>()
-        for (idx, match) in matches.enumerated() {
-            if let range = Range(match.range(at: 1), in: html) {
-                let mediaUrl = String(html[range])
-                guard mediaUrl.contains("snapchat") && !seenUrls.contains(mediaUrl) else { continue }
+        for (key, value) in dict {
+            // نتجنب spotlightHighlights أو curatedHighlights لكي لا يحمل مقاطع غير الستوري اليومي
+            if key == "spotlightHighlights" || key == "curatedHighlights" || key == "lenses" {
+                continue
+            }
+            if let subDict = value as? [String: Any] {
+                let subResults = findSnapListRecursively(in: subDict)
+                if !subResults.isEmpty { return subResults }
+            }
+        }
+        return results
+    }
+
+    // MARK: - محلل نظام سناب شات الجديد (Next.js App Router / self.__next_f.push)
+
+    private func parseStoryFromNextFlightRSC(_ html: String) -> (snaps: [StorySnapInfo], foundStructure: Bool) {
+        var snaps: [StorySnapInfo] = []
+        let hasNextF = html.contains("__next_f") || html.contains("snapList") || html.contains("userProfile")
+
+        // فك تهريب النصوص المدمجة داخل self.__next_f.push([1, "..."])
+        let unescaped = html
+            .replacingOccurrences(of: #"\\\""#, with: #"""#)
+            .replacingOccurrences(of: #"\\/"#, with: "/")
+            .replacingOccurrences(of: #"\"#, with: #"""#)
+            .replacingOccurrences(of: #"\/"#, with: "/")
+            .replacingOccurrences(of: "\\u0026", with: "&")
+            .replacingOccurrences(of: "&amp;", with: "&")
+
+        // 1. محاولة استخراج مصفوفة "snapList":[...] بالكامل كـ JSON
+        if let snapListArray = extractJSONArrayAfterKey(key: #""snapList":"#, in: unescaped) {
+            for (idx, item) in snapListArray.enumerated() {
+                if let info = extractSingleSnap(from: item, sequenceIndex: idx) {
+                    snaps.append(info)
+                }
+            }
+            if !snaps.isEmpty {
+                return (snaps, true)
+            }
+        }
+
+        // 2. إذا كانت مقسمة عبر عدة Chunks في __next_f، نستخرج عناصر الستوري عبر snapUrls.mediaUrl مباشرة
+        let snapItemPattern = #""snapId"\s*:\s*(?:\{\s*"value"\s*:\s*"([^"]+)"\s*\}|"([^"]+)")[\s\S]{1,1200}?"snapUrls"\s*:\s*\{[^}]*?"mediaUrl"\s*:\s*"(https://[^"]+)""#
+        if let regex = try? NSRegularExpression(pattern: snapItemPattern, options: []) {
+            let matches = regex.matches(in: unescaped, options: [], range: NSRange(unescaped.startIndex..., in: unescaped))
+            var seenUrls = Set<String>()
+
+            for (idx, match) in matches.enumerated() {
+                var snapId = ""
+                if let r1 = Range(match.range(at: 1), in: unescaped) {
+                    snapId = String(unescaped[r1])
+                } else if let r2 = Range(match.range(at: 2), in: unescaped) {
+                    snapId = String(unescaped[r2])
+                }
+                guard let urlRange = Range(match.range(at: 3), in: unescaped) else { continue }
+                let mediaUrl = String(unescaped[urlRange])
+
+                guard !seenUrls.contains(mediaUrl) else { continue }
                 seenUrls.insert(mediaUrl)
 
-                let isVideo = mediaUrl.lowercased().contains(".mp4")
-                let snapId = URL(string: mediaUrl)?.lastPathComponent ?? UUID().uuidString
-                let timestamp = Date().timeIntervalSince1970
+                // البحث عن نوع المقطع والتاريخ في نفس النطاق النصي
+                let matchSubStr: String
+                if let fullRange = Range(match.range, in: unescaped) {
+                    let endIdx = unescaped.index(fullRange.upperBound, offsetBy: 400, limitedBy: unescaped.endIndex) ?? unescaped.endIndex
+                    matchSubStr = String(unescaped[fullRange.lowerBound..<endIdx])
+                } else {
+                    matchSubStr = ""
+                }
 
-                results.append(StorySnapInfo(
+                let isVideo = matchSubStr.contains(#""snapMediaType":1"#) || matchSubStr.contains(#""snapMediaType": 1"#) || mediaUrl.lowercased().contains(".mp4")
+
+                var timestamp = Date().timeIntervalSince1970
+                let tsPattern = #""timestampInSec"\s*:\s*(?:\{\s*"value"\s*:\s*"?(\d+)"?\s*\}|"?(\d+)"?)"#
+                if let tsRegex = try? NSRegularExpression(pattern: tsPattern, options: []),
+                   let tsMatch = tsRegex.firstMatch(in: matchSubStr, options: [], range: NSRange(matchSubStr.startIndex..., in: matchSubStr)) {
+                    let tsStr: String? = Range(tsMatch.range(at: 1), in: matchSubStr).map { String(matchSubStr[$0]) }
+                        ?? Range(tsMatch.range(at: 2), in: matchSubStr).map { String(matchSubStr[$0]) }
+                    if let s = tsStr, var val = Double(s) {
+                        if val > 10_000_000_000 { val /= 1000.0 }
+                        if val > 0 { timestamp = val }
+                    }
+                }
+
+                if snapId.isEmpty {
+                    let cleanUrl = mediaUrl.components(separatedBy: "?").first ?? mediaUrl
+                    snapId = URL(string: cleanUrl)?.lastPathComponent ?? UUID().uuidString
+                }
+
+                snaps.append(StorySnapInfo(
                     id: snapId,
                     mediaUrl: mediaUrl,
                     isVideo: isVideo,
@@ -1079,7 +1177,64 @@ class VaultViewModel: ObservableObject {
                 ))
             }
         }
-        return results
+
+        return (snaps, hasNextF)
+    }
+
+    private func extractJSONArrayAfterKey(key: String, in text: String) -> [[String: Any]]? {
+        var searchRange = text.startIndex..<text.endIndex
+        while let keyRange = text.range(of: key, options: [], range: searchRange) {
+            var cursor = keyRange.upperBound
+            while cursor < text.endIndex && (text[cursor].isWhitespace || text[cursor].isNewline) {
+                cursor = text.index(after: cursor)
+            }
+
+            guard cursor < text.endIndex, text[cursor] == "[" else {
+                searchRange = keyRange.upperBound..<text.endIndex
+                continue
+            }
+
+            let arrayStart = cursor
+            var depth = 0
+            var inString = false
+            var isEscaped = false
+            var arrayEnd: String.Index? = nil
+
+            var idx = arrayStart
+            while idx < text.endIndex {
+                let ch = text[idx]
+                if isEscaped {
+                    isEscaped = false
+                } else if ch == "\\" {
+                    isEscaped = true
+                } else if ch == "\"" {
+                    inString.toggle()
+                } else if !inString {
+                    if ch == "[" {
+                        depth += 1
+                    } else if ch == "]" {
+                        depth -= 1
+                        if depth == 0 {
+                            arrayEnd = text.index(after: idx)
+                            break
+                        }
+                    }
+                }
+                idx = text.index(after: idx)
+            }
+
+            if let end = arrayEnd {
+                let jsonSlice = String(text[arrayStart..<end])
+                if let data = jsonSlice.data(using: .utf8),
+                   let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                   !arr.isEmpty {
+                    return arr
+                }
+            }
+
+            searchRange = keyRange.upperBound..<text.endIndex
+        }
+        return nil
     }
 
     private func extractSingleSnap(from item: [String: Any], sequenceIndex: Int) -> StorySnapInfo? {
