@@ -8,7 +8,43 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    steps:name: Build SnapVault 2 IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode project and build IPA
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project SnapVault2.xcodeproj \
+            -scheme SnapVault2 \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath build/SnapVault2.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          mkdir -p build/Payload
+          cp -r build/SnapVault2.xcarchive/Products/Applications/*.app build/Payload/
+          cd build && zip -r SnapVault2.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapVault2-IPA
+          path: build/SnapVault2.ipa
       - name: Checkout
         uses: actions/checkout@v4
 
