@@ -1,0 +1,31 @@
+name: SnapVault2
+options:
+  bundleIdPrefix: com.xhamad0
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  SnapVault2:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: SnapVault 2
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSFaceIDUsageDescription: لحماية المحفوظات ببصمة الوجه
+        NSPhotoLibraryAddUsageDescription: لحفظ المقاطع المختارة في ألبوم الصور
+        UIBackgroundModes:
+          - audio
+          - fetch
+          - processing
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xhamad0.snapvault2
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
